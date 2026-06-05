@@ -237,6 +237,7 @@ func cmdSamples() {
 	}{
 		{"templates", filepath.Join(repoRoot, "openscad", "templates")},
 		{"samples", filepath.Join(repoRoot, "openscad", "samples")},
+		{"cnc-box", filepath.Join(repoRoot, "openscad", "cnc-box")},
 		{"flatpack", filepath.Join(repoRoot, "openscad", "flatpack")},
 		{"french-cleat", filepath.Join(repoRoot, "openscad", "french-cleat")},
 	}
@@ -458,6 +459,7 @@ func resolveScad(nameOrPath string) string {
 		filepath.Join(repoRoot, "openscad", "samples"),
 		filepath.Join(repoRoot, "openscad", "flatpack"),
 		filepath.Join(repoRoot, "openscad", "french-cleat"),
+		filepath.Join(repoRoot, "openscad", "cnc-box"),
 	}
 	for _, d := range searchDirs {
 		p := filepath.Join(d, name)
