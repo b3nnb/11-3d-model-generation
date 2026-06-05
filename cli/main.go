@@ -454,6 +454,39 @@ func cmdPreview(scadPath, outDir string, imgW, imgH int) {
 // Command: export — export a .scad to a specific format (dxf, svg, 3mf, amf)
 // For CNC workflows: export to SVG/DXF for toolpath generation.
 // ------------------------------------------------------------
+// detectCNCPanels scans a .scad file for CNC-style panel module names.
+// Returns the list of panel module names in layout order.
+func detectCNCPanels(scadPath string) []string {
+	src, err := os.ReadFile(scadPath)
+	if err != nil {
+		return nil
+	}
+	// Known CNC panel module patterns
+	candidates := []string{"panel_bottom", "panel_front", "panel_back", "panel_side", "panel_left", "panel_right", "panel_lid", "panel_top"}
+	var found []string
+	for _, mod := range candidates {
+		if bytes.Contains(src, []byte("module "+mod+"(")) {
+			found = append(found, mod)
+		}
+	}
+	return found
+}
+
+// buildCNCPanelWrapper generates a projection() wrapper that uses the source file's
+// modules and arranges them flat for SVG/DXF export.
+func buildCNCPanelWrapper(abspath string, panels []string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("use <%s>;\n\n", abspath))
+	sb.WriteString("projection(cut=false) {\n")
+	// Layout panels in a row with 400mm spacing between them
+	for i, panel := range panels {
+		offset := i * 400
+		sb.WriteString(fmt.Sprintf("    translate([%d, 0, 0]) %s();\n", offset, panel))
+	}
+	sb.WriteString("}\n")
+	return sb.String()
+}
+
 func cmdExport(scadPath, format, outDir string) {
 	supportedFormats := map[string]bool{
 		"dxf": true, "svg": true, "3mf": true, "amf": true, "off": true, "stl": true,
@@ -482,10 +515,53 @@ func cmdExport(scadPath, format, outDir string) {
 
 	fmt.Printf("📤 Exporting %s → %s ...\n", filepath.Base(scadPath), outPath)
 
-	cmd := exec.Command("openscad", "-o", outPath, scadPath)
+	// SVG and DXF require a 2D object. CNC flatpack/box designs export as 3D models
+	// but can be flattened to 2D via projection() for CNC toolpath software.
+	// Strategy: use `use <file>` (imports modules only, no top-level geometry) then
+	// call projection() around the known CNC panel modules.
+	needs2D := format == "svg" || format == "dxf"
+	actualScad := scadPath
+
+	if needs2D {
+		abspath, _ := filepath.Abs(scadPath)
+
+		// Detect CNC panel modules in the source file
+		panels := detectCNCPanels(scadPath)
+
+		var wrapperBody string
+		if len(panels) > 0 {
+			// Known CNC panel layout: use modules + arrange panels in projection
+			fmt.Printf("   ℹ️  CNC panel mode — detected panels: %s\n", strings.Join(panels, ", "))
+			wrapperBody = buildCNCPanelWrapper(abspath, panels)
+		} else {
+			// Generic fallback: wrap entire file content in projection using include
+			// (works only for files without module-only definitions causing conflicts)
+			wrapperBody = fmt.Sprintf("projection(cut=false) {\n  include <%s>;\n}\n", abspath)
+		}
+
+		tmpf, err := os.CreateTemp("", "modelgen-export-*.scad")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Cannot create temp file: %v\n", err)
+			os.Exit(1)
+		}
+		defer os.Remove(tmpf.Name())
+		if _, err := tmpf.WriteString(wrapperBody); err != nil {
+			tmpf.Close()
+			fmt.Fprintf(os.Stderr, "❌ Cannot write temp file: %v\n", err)
+			os.Exit(1)
+		}
+		tmpf.Close()
+		actualScad = tmpf.Name()
+		fmt.Printf("   ℹ️  2D format — wrapping with projection() for CNC export\n")
+	}
+
+	cmd := exec.Command("openscad", "-o", outPath, actualScad)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("❌ Export failed: %v\n%s\n", err, strings.TrimSpace(string(out)))
+		if needs2D {
+			fmt.Printf("   Tip: for 3D CNC box models, render to STL first, then use your slicer/CAM software to export SVG/DXF.\n")
+		}
 		os.Exit(1)
 	}
 	fi, _ := os.Stat(outPath)
