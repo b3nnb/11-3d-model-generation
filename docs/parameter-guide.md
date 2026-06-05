@@ -56,6 +56,42 @@ Every model in this library is **fully parametric**: all dimensions live in name
 
 ---
 
+### `makita_drill_mount.scad` — Makita 18V Drill French Cleat Mount
+Designed for Makita 18V compact drills. Drill hangs trigger-down, handle resting in a contoured pocket.
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `handle_w` | 52mm | Handle grip width at narrowest point — **measure this** |
+| `handle_d` | 37mm | Handle depth front-to-back — **measure this** |
+| `plate_w` | 90mm | Width of the backing plate |
+| `cradle_gap` | 1.0mm | Clearance so handle slides in; increase to 1.5mm if tight |
+| `lip_h` | 8mm | Retention lip height — increase if drill pops out |
+
+**Calibration tip:** Print with default values first. Drill should click in with light pressure and not fall out when shaken. If too tight, increase `cradle_gap`. If too loose, increase `lip_h`.
+
+---
+
+### `makita_battery_mount.scad` — Makita 18V Battery Pack Holder
+Holds 2× BL18xx batteries side-by-side on a French cleat wall.
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `num_batteries` | 2 | Change to 3 for a 3-pack strip |
+| `battery_gap` | 1.0mm | Slide clearance per battery |
+| `pocket_gap` | 8mm | Gap between battery slots |
+
+---
+
+### `blank_holder_strip.scad` — Generic Cleat Strip (baseplate)
+Flat mounting strip with a French cleat hook and optional screw holes. Use as a base for custom bins or tool holders.
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| `strip_w` | 150mm | Width of the strip — match to cleat slot spacing |
+| `strip_h` | 80mm | Height of the strip |
+| `add_screw_holes` | true | M4 counterbore holes for attaching bins/hooks |
+| `screw_cols` | 3 | Columns of attachment holes |
+| `screw_rows` | 2 | Rows of attachment holes |
+
+---
+
 ### `flatpack_box.scad` — CNC Finger Joint Box
 | Parameter | Default | Notes |
 |-----------|---------|-------|
