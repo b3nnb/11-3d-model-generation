@@ -4,19 +4,25 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultModel = "qwen3:14b"
 const ollamaURL = "http://localhost:11434/api/chat"
+
+// Location of the templates/samples relative to the repo root.
+// Resolved from the binary's own path.
+var repoRoot string
 
 // French cleat dimensions — stored as a system context so user doesn't repeat it
 const frenchCleatContext = `
@@ -91,7 +97,7 @@ func chat(userMsg string) (string, error) {
 		Stream:   false,
 	})
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 180 * time.Second}
 	resp, err := client.Post(ollamaURL, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("ollama request failed: %w", err)
@@ -160,21 +166,564 @@ func saveAndRender(scadCode, name, outDir string) error {
 	return nil
 }
 
-func main() {
-	outDir := flag.String("out", "./models", "Output directory for .scad and .stl files")
-	name := flag.String("name", "", "Model name (used for filenames, prompted if empty)")
-	oneShot := flag.String("prompt", "", "Non-interactive: describe the model and exit")
-	flag.Parse()
+// ------------------------------------------------------------
+// extractParams reads top-level variable declarations from a .scad file
+// and returns them as a map[name]value. Only handles simple assignments:
+//   width = 80;   // comment
+// ------------------------------------------------------------
+var paramRe = regexp.MustCompile(`(?m)^\s*([a-zA-Z_]\w*)\s*=\s*([^;]+);\s*(?://\s*(.*))?$`)
 
-	if err := os.MkdirAll(*outDir, 0755); err != nil {
+func extractParams(scadSrc string) []paramEntry {
+	matches := paramRe.FindAllStringSubmatch(scadSrc, -1)
+	var out []paramEntry
+	seen := map[string]bool{}
+	for _, m := range matches {
+		name := strings.TrimSpace(m[1])
+		val := strings.TrimSpace(m[2])
+		comment := strings.TrimSpace(m[3])
+		// Skip non-primitive / long values
+		if strings.Contains(val, "[") || len(val) > 40 {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, paramEntry{Name: name, Default: val, Comment: comment})
+	}
+	return out
+}
+
+type paramEntry struct {
+	Name    string
+	Default string
+	Comment string
+}
+
+// applyOverrides substitutes parameter values in .scad source.
+// overrides is a slice of "name=value" strings.
+func applyOverrides(scadSrc string, overrides []string) string {
+	for _, kv := range overrides {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			fmt.Fprintf(os.Stderr, "⚠️  Skipping malformed override %q — use name=value\n", kv)
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		newVal := strings.TrimSpace(parts[1])
+		// Replace first occurrence of `name = <old_val>;`
+		re := regexp.MustCompile(`(?m)(^\s*` + regexp.QuoteMeta(name) + `\s*=\s*)([^;]+)(;)`)
+		if !re.MatchString(scadSrc) {
+			fmt.Fprintf(os.Stderr, "⚠️  Parameter %q not found in file\n", name)
+			continue
+		}
+		scadSrc = re.ReplaceAllStringFunc(scadSrc, func(s string) string {
+			// Preserve leading whitespace and trailing semicolon
+			sub := re.FindStringSubmatch(s)
+			return sub[1] + newVal + sub[3]
+		})
+		fmt.Printf("  ✦ %s = %s\n", name, newVal)
+	}
+	return scadSrc
+}
+
+// ------------------------------------------------------------
+// Command: samples — list available sample + template .scad files
+// ------------------------------------------------------------
+func cmdSamples() {
+	dirs := []struct {
+		label string
+		path  string
+	}{
+		{"templates", filepath.Join(repoRoot, "openscad", "templates")},
+		{"samples", filepath.Join(repoRoot, "openscad", "samples")},
+		{"cnc-box", filepath.Join(repoRoot, "openscad", "cnc-box")},
+		{"flatpack", filepath.Join(repoRoot, "openscad", "flatpack")},
+		{"french-cleat", filepath.Join(repoRoot, "openscad", "french-cleat")},
+	}
+
+	fmt.Println()
+	fmt.Println("📦 Available models")
+	fmt.Println()
+	for _, d := range dirs {
+		entries, err := os.ReadDir(d.path)
+		if err != nil {
+			continue
+		}
+		var names []string
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".scad") {
+				names = append(names, e.Name())
+			}
+		}
+		if len(names) == 0 {
+			continue
+		}
+		sort.Strings(names)
+		fmt.Printf("  ── %s/ ──\n", d.label)
+		for _, n := range names {
+			p := filepath.Join(d.path, n)
+			src, _ := os.ReadFile(p)
+			params := extractParams(string(src))
+			paramSummary := ""
+			if len(params) > 0 {
+				var parts []string
+				for i, p := range params {
+					if i >= 4 {
+						parts = append(parts, "…")
+						break
+					}
+					parts = append(parts, p.Name+"="+p.Default)
+				}
+				paramSummary = "  [" + strings.Join(parts, ", ") + "]"
+			}
+			fmt.Printf("  %-38s%s\n", strings.TrimSuffix(n, ".scad"), paramSummary)
+		}
+		fmt.Println()
+	}
+	fmt.Println("Use 'modelgen from <name> [key=val ...]' to instantiate with overrides.")
+	fmt.Println("Use 'modelgen render <file.scad>' to render a specific file to STL.")
+}
+
+// ------------------------------------------------------------
+// Command: params — show all parameters in a .scad file
+// ------------------------------------------------------------
+func cmdParams(path string) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	params := extractParams(string(src))
+	if len(params) == 0 {
+		fmt.Println("No simple parameters found.")
+		return
+	}
+	fmt.Printf("\n📐 Parameters in %s\n\n", filepath.Base(path))
+	maxName := 0
+	for _, p := range params {
+		if len(p.Name) > maxName {
+			maxName = len(p.Name)
+		}
+	}
+	for _, p := range params {
+		comment := ""
+		if p.Comment != "" {
+			comment = "  // " + p.Comment
+		}
+		fmt.Printf("  %-*s = %s%s\n", maxName, p.Name, p.Default, comment)
+	}
+	fmt.Printf("\nOverride with: modelgen from %s key=newval ...\n\n", filepath.Base(path))
+}
+
+// ------------------------------------------------------------
+// Command: render — render a single .scad file to STL
+// ------------------------------------------------------------
+func cmdRender(scadPath, outDir string) {
+	if outDir == "" {
+		outDir = filepath.Dir(scadPath)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
+		os.Exit(1)
+	}
+	base := strings.TrimSuffix(filepath.Base(scadPath), ".scad")
+	stlPath := filepath.Join(outDir, base+".stl")
+
+	if _, err := exec.LookPath("openscad"); err != nil {
+		fmt.Fprintln(os.Stderr, "❌ openscad not found in PATH")
+		os.Exit(1)
+	}
+
+	fmt.Printf("🔧 Rendering %s → %s ...\n", filepath.Base(scadPath), stlPath)
+	cmd := exec.Command("openscad", "-o", stlPath, scadPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("❌ Render failed: %v\n", err)
+		os.Exit(1)
+	}
+	fi, _ := os.Stat(stlPath)
+	if fi != nil {
+		fmt.Printf("✅ STL written: %s (%s)\n", stlPath, humanSize(fi.Size()))
+	}
+}
+
+// ------------------------------------------------------------
+// Command: render-all — render every .scad in a directory
+// ------------------------------------------------------------
+func cmdRenderAll(dir, outDir string) {
+	if outDir == "" {
+		outDir = filepath.Join(dir, "stl-output")
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
+		os.Exit(1)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot read dir %s: %v\n", dir, err)
+		os.Exit(1)
+	}
+
+	if _, err := exec.LookPath("openscad"); err != nil {
+		fmt.Fprintln(os.Stderr, "❌ openscad not found in PATH")
+		os.Exit(1)
+	}
+
+	passed, failed := 0, 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".scad") {
+			continue
+		}
+		scadPath := filepath.Join(dir, e.Name())
+		stlPath := filepath.Join(outDir, strings.TrimSuffix(e.Name(), ".scad")+".stl")
+		fmt.Printf("  🔧 %-35s → ", e.Name())
+		cmd := exec.Command("openscad", "-o", stlPath, scadPath)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("❌  %v\n", err)
+			if len(out) > 0 {
+				fmt.Printf("      %s\n", strings.TrimSpace(string(out)))
+			}
+			failed++
+		} else {
+			fi, _ := os.Stat(stlPath)
+			size := ""
+			if fi != nil {
+				size = humanSize(fi.Size())
+			}
+			fmt.Printf("✅  %s\n", size)
+			passed++
+		}
+	}
+	fmt.Printf("\n%d passed, %d failed  →  %s\n\n", passed, failed, outDir)
+}
+
+// ------------------------------------------------------------
+// Command: from — instantiate a template/sample with param overrides
+// ------------------------------------------------------------
+func cmdFrom(nameOrPath string, overrides []string, outDir string) {
+	// Resolve path — accept bare name (looks in templates + samples) or a full path
+	scadPath := resolveScad(nameOrPath)
+	if scadPath == "" {
+		fmt.Fprintf(os.Stderr, "❌ Cannot find %q — run 'modelgen samples' to list available models\n", nameOrPath)
+		os.Exit(1)
+	}
+
+	src, err := os.ReadFile(scadPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading %s: %v\n", scadPath, err)
+		os.Exit(1)
+	}
+
+	base := strings.TrimSuffix(filepath.Base(scadPath), ".scad")
+	if len(overrides) > 0 {
+		fmt.Printf("\n🔩 Applying parameter overrides to %s:\n", base)
+	}
+	modified := applyOverrides(string(src), overrides)
+
+	if outDir == "" {
+		outDir = "./models"
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Generate output name
+	outName := base
+	if len(overrides) > 0 {
+		outName = base + "_custom_" + time.Now().Format("150405")
+	}
+
+	if err := saveAndRender(modified, outName, outDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// resolveScad finds a .scad file by name or path
+func resolveScad(nameOrPath string) string {
+	// Direct path
+	if _, err := os.Stat(nameOrPath); err == nil {
+		return nameOrPath
+	}
+	// Bare name — search openscad subdirs
+	name := nameOrPath
+	if !strings.HasSuffix(name, ".scad") {
+		name += ".scad"
+	}
+	searchDirs := []string{
+		filepath.Join(repoRoot, "openscad", "templates"),
+		filepath.Join(repoRoot, "openscad", "samples"),
+		filepath.Join(repoRoot, "openscad", "flatpack"),
+		filepath.Join(repoRoot, "openscad", "french-cleat"),
+		filepath.Join(repoRoot, "openscad", "cnc-box"),
+	}
+	for _, d := range searchDirs {
+		p := filepath.Join(d, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// ------------------------------------------------------------
+// Command: install — copy binary to ~/.local/bin/modelgen
+// ------------------------------------------------------------
+func cmdInstall() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot determine binary path: %v\n", err)
+		os.Exit(1)
+	}
+	dest := filepath.Join(os.Getenv("HOME"), ".local", "bin", "modelgen")
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create ~/.local/bin: %v\n", err)
+		os.Exit(1)
+	}
+	// Read source
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot read binary: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(dest, data, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot write %s: %v\n", dest, err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Installed: %s\n", dest)
+	fmt.Printf("   Make sure ~/.local/bin is in your PATH.\n")
+	fmt.Printf("   Add to ~/.bashrc:  export PATH=\"$HOME/.local/bin:$PATH\"\n")
+}
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.0f KB", float64(n)/(1<<10))
+	default:
+		return strconv.FormatInt(n, 10) + " B"
+	}
+}
+
+func printHelp() {
+	fmt.Println(`modelgen — 3D Model Generator (Friday CLI)
+
+SUBCOMMANDS
+  modelgen                         Interactive chat → SCAD generation
+  modelgen samples                 List available templates and sample models
+  modelgen params <file.scad>      Show all adjustable parameters in a file
+  modelgen render <file.scad>      Render a .scad file to STL
+  modelgen render-all <dir>        Render all .scad files in a directory
+  modelgen from <name> [k=v ...]   Instantiate a template with param overrides
+  modelgen install                 Copy binary to ~/.local/bin/modelgen
+  modelgen help                    Show this help
+
+FLAGS (for interactive + one-shot modes)
+  -prompt <text>    One-shot: generate a model from description and exit
+  -name <name>      Output filename (without extension)
+  -out <dir>        Output directory (default: ./models)
+
+EXAMPLES
+  # List everything available
+  modelgen samples
+
+  # Show parameters for the box template
+  modelgen params box_parametric
+
+  # Make a custom box with overrides and render to STL
+  modelgen from box_parametric width=120 depth=90 height=50 fillet=5
+
+  # Render a specific file
+  modelgen render openscad/samples/phone_stand.scad
+
+  # Render all samples to stl-output/
+  modelgen render-all openscad/samples
+
+  # One-shot: generate from description
+  modelgen -prompt "Makita drill French cleat mount" -name drill_mount
+
+  # Interactive chat mode
+  modelgen
+
+PRE-LOADED CONTEXT (you never need to specify these)
+  French cleat: 19mm ply, 45° angle, 22mm hook depth
+  CNC: 3.175mm bit, dogbone reliefs, 18mm plywood, finger joints
+  3D print: 0.4mm nozzle, 0.2mm layers, 45° overhang limit`)
+}
+
+
+// ------------------------------------------------------------
+// initRepoRoot — find the repo root by walking up from the binary,
+// or from MODELGEN_ROOT env var, or the known default install path.
+// ------------------------------------------------------------
+func initRepoRoot() {
+	// 1. Explicit env override
+	if env := os.Getenv("MODELGEN_ROOT"); env != "" {
+		repoRoot = env
+		return
+	}
+
+	// 2. Known default location
+	defaultPath := filepath.Join(os.Getenv("HOME"), "Documents", "code", "3d-model-generation")
+	if _, err := os.Stat(filepath.Join(defaultPath, "openscad")); err == nil {
+		repoRoot = defaultPath
+		return
+	}
+
+	// 3. Walk up from the binary (works when run directly from the repo)
+	exe, err := os.Executable()
+	if err != nil {
+		repoRoot = "."
+		return
+	}
+	dir := filepath.Dir(exe)
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "openscad")); err == nil {
+			repoRoot = dir
+			return
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	// 4. Fallback: cwd
+	repoRoot = "."
+}
+
+// ------------------------------------------------------------
+// main
+// ------------------------------------------------------------
+func main() {
+	initRepoRoot()
+
+	args := os.Args[1:]
+
+	// Handle subcommands first
+	if len(args) > 0 {
+		switch args[0] {
+		case "samples", "list":
+			cmdSamples()
+			return
+
+		case "params":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen params <file.scad>")
+				os.Exit(1)
+			}
+			p := args[1]
+			if !strings.HasSuffix(p, ".scad") {
+				p = resolveScad(p)
+				if p == "" {
+					fmt.Fprintf(os.Stderr, "❌ File not found: %s\n", args[1])
+					os.Exit(1)
+				}
+			}
+			cmdParams(p)
+			return
+
+		case "render":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen render <file.scad> [--out <dir>]")
+				os.Exit(1)
+			}
+			outDir := ""
+			for i, a := range args[2:] {
+				if a == "--out" && i+1 < len(args[2:]) {
+					outDir = args[2:][i+1]
+				}
+			}
+			cmdRender(args[1], outDir)
+			return
+
+		case "render-all":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen render-all <dir> [--out <dir>]")
+				os.Exit(1)
+			}
+			outDir := ""
+			for i, a := range args[2:] {
+				if a == "--out" && i+1 < len(args[2:]) {
+					outDir = args[2:][i+1]
+				}
+			}
+			cmdRenderAll(args[1], outDir)
+			return
+
+		case "from":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen from <name|file> [key=val ...]")
+				os.Exit(1)
+			}
+			outDir := "./models"
+			remaining := args[2:]
+			var overrides []string
+			for _, a := range remaining {
+				if strings.HasPrefix(a, "--out=") {
+					outDir = strings.TrimPrefix(a, "--out=")
+				} else if a == "--out" {
+					// handled below via index — simple approach: collect non-flag args
+				} else if strings.Contains(a, "=") {
+					overrides = append(overrides, a)
+				}
+			}
+			cmdFrom(args[1], overrides, outDir)
+			return
+
+		case "install":
+			cmdInstall()
+			return
+
+		case "help", "--help", "-h":
+			printHelp()
+			return
+		}
+	}
+
+	// Legacy flag-based mode (interactive + -prompt one-shot)
+	outDir := "./models"
+	name := ""
+	oneShot := ""
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-out", "--out":
+			if i+1 < len(args) {
+				outDir = args[i+1]
+				i++
+			}
+		case "-name", "--name":
+			if i+1 < len(args) {
+				name = args[i+1]
+				i++
+			}
+		case "-prompt", "--prompt":
+			if i+1 < len(args) {
+				oneShot = args[i+1]
+				i++
+			}
+		}
+	}
+
+	if err := os.MkdirAll(outDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
 		os.Exit(1)
 	}
 
 	// One-shot mode
-	if *oneShot != "" {
+	if oneShot != "" {
 		fmt.Printf("🤖 Generating model...\n")
-		resp, err := chat(*oneShot)
+		resp, err := chat(oneShot)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -185,11 +734,11 @@ func main() {
 			fmt.Println(resp)
 			os.Exit(1)
 		}
-		modelName := *name
+		modelName := name
 		if modelName == "" {
 			modelName = "model_" + time.Now().Format("20060102_150405")
 		}
-		if err := saveAndRender(scad, modelName, *outDir); err != nil {
+		if err := saveAndRender(scad, modelName, outDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Save error: %v\n", err)
 			os.Exit(1)
 		}
@@ -203,10 +752,11 @@ func main() {
 	fmt.Println("╚════════════════════════════════════════╝")
 	fmt.Println("Describe a model, say 'save <name>' to save, 'exit' to quit.")
 	fmt.Println("French cleat dims, CNC params, and print profiles are pre-loaded.")
+	fmt.Println("Tip: run 'modelgen samples' to see available templates.")
 	fmt.Println()
 
 	currentSCAD := ""
-	currentName := *name
+	currentName := name
 
 	for {
 		fmt.Print("you> ")
@@ -233,7 +783,7 @@ func main() {
 				fmt.Println("Nothing to save yet — generate a model first.")
 				continue
 			}
-			if err := saveAndRender(currentSCAD, saveName, *outDir); err != nil {
+			if err := saveAndRender(currentSCAD, saveName, outDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Save error: %v\n", err)
 			}
 			currentName = saveName
