@@ -173,6 +173,37 @@ func saveAndRender(scadCode, name, outDir string) error {
 // ------------------------------------------------------------
 var paramRe = regexp.MustCompile(`(?m)^\s*([a-zA-Z_]\w*)\s*=\s*([^;]+);\s*(?://\s*(.*))?$`)
 
+// isDerivedValue returns true if the value contains operators / function calls,
+// meaning it's a computed/derived variable rather than a direct user parameter.
+func isDerivedValue(val string) bool {
+	// Contains arithmetic operators (but not just a negative sign before a number)
+	trimmed := strings.TrimSpace(val)
+	// Allow: numbers, strings, true/false — block expressions
+	if strings.ContainsAny(trimmed, "+*/") {
+		return true
+	}
+	// Contains function calls like max(), floor(), etc.
+	if regexp.MustCompile(`\w+\s*\(`).MatchString(trimmed) {
+		return true
+	}
+	// Contains variable references (identifier not a plain number/bool/string)
+	if regexp.MustCompile(`[a-zA-Z_]\w*`).MatchString(trimmed) {
+		// It's OK if it's just true/false
+		if trimmed == "true" || trimmed == "false" {
+			return false
+		}
+		// It's OK if it starts with a quote (string literal)
+		if strings.HasPrefix(trimmed, "\"") {
+			return false
+		}
+		// Otherwise, if it contains an identifier that isn't a number — it's derived
+		if !regexp.MustCompile(`^-?[0-9]*\.?[0-9]+$`).MatchString(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
 func extractParams(scadSrc string) []paramEntry {
 	matches := paramRe.FindAllStringSubmatch(scadSrc, -1)
 	var out []paramEntry
@@ -182,7 +213,11 @@ func extractParams(scadSrc string) []paramEntry {
 		val := strings.TrimSpace(m[2])
 		comment := strings.TrimSpace(m[3])
 		// Skip non-primitive / long values
-		if strings.Contains(val, "[") || len(val) > 40 {
+		if strings.Contains(val, "[") || len(val) > 60 {
+			continue
+		}
+		// Skip derived/computed variables — only show user-tunable params
+		if isDerivedValue(val) {
 			continue
 		}
 		if seen[name] {
@@ -346,6 +381,126 @@ func cmdRender(scadPath, outDir string) {
 	fi, _ := os.Stat(stlPath)
 	if fi != nil {
 		fmt.Printf("✅ STL written: %s (%s)\n", stlPath, humanSize(fi.Size()))
+	}
+}
+
+// ------------------------------------------------------------
+// Command: preview — render a .scad to PNG for visual inspection
+// Requires xvfb-run (headless) or a display.
+// ------------------------------------------------------------
+func cmdPreview(scadPath, outDir string, imgW, imgH int) {
+	if outDir == "" {
+		outDir = filepath.Dir(scadPath)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
+		os.Exit(1)
+	}
+	base := strings.TrimSuffix(filepath.Base(scadPath), ".scad")
+	pngPath := filepath.Join(outDir, base+".png")
+
+	if _, err := exec.LookPath("openscad"); err != nil {
+		fmt.Fprintln(os.Stderr, "❌ openscad not found in PATH")
+		os.Exit(1)
+	}
+
+	imgArg := fmt.Sprintf("%d,%d", imgW, imgH)
+
+	// Build the openscad args for PNG render
+	openscadArgs := []string{
+		"--camera", "0,0,0,55,0,25,350",
+		"--imgsize", imgArg,
+		"--render",
+		"--projection=ortho",
+		"--colorscheme=Cornfield",
+		"-o", pngPath,
+		scadPath,
+	}
+
+	fmt.Printf("📸 Rendering preview of %s → %s ...\n", filepath.Base(scadPath), pngPath)
+
+	var cmd *exec.Cmd
+	// Use xvfb-run if no display is available (headless server)
+	if os.Getenv("DISPLAY") == "" {
+		if _, err := exec.LookPath("xvfb-run"); err == nil {
+			args := append([]string{"-a", "openscad"}, openscadArgs...)
+			cmd = exec.Command("xvfb-run", args...)
+		} else {
+			fmt.Fprintln(os.Stderr, "⚠️  No DISPLAY and xvfb-run not found — PNG preview may fail")
+			cmd = exec.Command("openscad", openscadArgs...)
+		}
+	} else {
+		cmd = exec.Command("openscad", openscadArgs...)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("❌ Preview render failed: %v\n", err)
+		if len(out) > 0 {
+			fmt.Printf("   %s\n", strings.TrimSpace(string(out)))
+		}
+		os.Exit(1)
+	}
+	fi, _ := os.Stat(pngPath)
+	if fi == nil || fi.Size() < 100 {
+		fmt.Println("❌ PNG was empty — render likely failed silently. Check xvfb-run is installed.")
+		os.Exit(1)
+	}
+	fmt.Printf("✅ Preview: %s (%s)\n", pngPath, humanSize(fi.Size()))
+	fmt.Printf("   Open with:  xdg-open %s\n", pngPath)
+}
+
+// ------------------------------------------------------------
+// Command: export — export a .scad to a specific format (dxf, svg, 3mf, amf)
+// For CNC workflows: export to SVG/DXF for toolpath generation.
+// ------------------------------------------------------------
+func cmdExport(scadPath, format, outDir string) {
+	supportedFormats := map[string]bool{
+		"dxf": true, "svg": true, "3mf": true, "amf": true, "off": true, "stl": true,
+	}
+	format = strings.ToLower(format)
+	if !supportedFormats[format] {
+		fmt.Fprintf(os.Stderr, "❌ Unsupported format %q — choose from: dxf, svg, 3mf, amf, stl\n", format)
+		os.Exit(1)
+	}
+
+	if outDir == "" {
+		outDir = filepath.Dir(scadPath)
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot create output dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	if _, err := exec.LookPath("openscad"); err != nil {
+		fmt.Fprintln(os.Stderr, "❌ openscad not found in PATH")
+		os.Exit(1)
+	}
+
+	base := strings.TrimSuffix(filepath.Base(scadPath), ".scad")
+	outPath := filepath.Join(outDir, base+"."+format)
+
+	fmt.Printf("📤 Exporting %s → %s ...\n", filepath.Base(scadPath), outPath)
+
+	cmd := exec.Command("openscad", "-o", outPath, scadPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("❌ Export failed: %v\n%s\n", err, strings.TrimSpace(string(out)))
+		os.Exit(1)
+	}
+	fi, _ := os.Stat(outPath)
+	if fi != nil {
+		fmt.Printf("✅ Exported: %s (%s)\n", outPath, humanSize(fi.Size()))
+	} else {
+		fmt.Println("⚠️  Export completed but output file not found.")
+	}
+	if len(out) > 0 {
+		// Print any warnings
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, "WARNING") || strings.Contains(line, "ERROR") {
+				fmt.Printf("   ⚠️  %s\n", line)
+			}
+		}
 	}
 }
 
@@ -522,6 +677,8 @@ SUBCOMMANDS
   modelgen params <file.scad>      Show all adjustable parameters in a file
   modelgen render <file.scad>      Render a .scad file to STL
   modelgen render-all <dir>        Render all .scad files in a directory
+  modelgen preview <file.scad>     Render a .scad to PNG for visual inspection
+  modelgen export <file.scad> <fmt> Export to dxf, svg, 3mf, amf (for CNC/slicers)
   modelgen from <name> [k=v ...]   Instantiate a template with param overrides
   modelgen install                 Copy binary to ~/.local/bin/modelgen
   modelgen help                    Show this help
@@ -530,6 +687,9 @@ FLAGS (for interactive + one-shot modes)
   -prompt <text>    One-shot: generate a model from description and exit
   -name <name>      Output filename (without extension)
   -out <dir>        Output directory (default: ./models)
+
+PREVIEW OPTIONS
+  --size <WxH>      Image size for preview PNG (default: 800x600)
 
 EXAMPLES
   # List everything available
@@ -540,6 +700,17 @@ EXAMPLES
 
   # Make a custom box with overrides and render to STL
   modelgen from box_parametric width=120 depth=90 height=50 fillet=5
+
+  # Preview a model as PNG
+  modelgen preview openscad/samples/phone_stand.scad
+  modelgen preview openscad/cnc-box/cnc_routed_box.scad --out ./previews
+
+  # Export for CNC toolpath (SVG or DXF)
+  modelgen export openscad/cnc-box/cnc_routed_box.scad svg
+  modelgen export openscad/cnc-box/cnc_routed_box.scad dxf --out ./cnc-output
+
+  # Export for slicer (3MF includes colour info)
+  modelgen export openscad/samples/phone_stand.scad 3mf
 
   # Render a specific file
   modelgen render openscad/samples/phone_stand.scad
@@ -658,6 +829,72 @@ func main() {
 				}
 			}
 			cmdRenderAll(args[1], outDir)
+			return
+
+		case "preview":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen preview <file.scad> [--out <dir>] [--size WxH]")
+				os.Exit(1)
+			}
+			outDir := ""
+			imgW, imgH := 800, 600
+			for i := 2; i < len(args); i++ {
+				switch {
+				case args[i] == "--out" && i+1 < len(args):
+					outDir = args[i+1]
+					i++
+				case strings.HasPrefix(args[i], "--out="):
+					outDir = strings.TrimPrefix(args[i], "--out=")
+				case args[i] == "--size" && i+1 < len(args):
+					parts := strings.SplitN(args[i+1], "x", 2)
+					if len(parts) == 2 {
+						fmt.Sscanf(parts[0], "%d", &imgW)
+						fmt.Sscanf(parts[1], "%d", &imgH)
+					}
+					i++
+				case strings.HasPrefix(args[i], "--size="):
+					parts := strings.SplitN(strings.TrimPrefix(args[i], "--size="), "x", 2)
+					if len(parts) == 2 {
+						fmt.Sscanf(parts[0], "%d", &imgW)
+						fmt.Sscanf(parts[1], "%d", &imgH)
+					}
+				}
+			}
+			scadPath := args[1]
+			if !strings.HasSuffix(scadPath, ".scad") {
+				scadPath = resolveScad(scadPath)
+				if scadPath == "" {
+					fmt.Fprintf(os.Stderr, "❌ File not found: %s\n", args[1])
+					os.Exit(1)
+				}
+			}
+			cmdPreview(scadPath, outDir, imgW, imgH)
+			return
+
+		case "export":
+			if len(args) < 3 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen export <file.scad> <format> [--out <dir>]")
+				fmt.Fprintln(os.Stderr, "Formats: dxf, svg, 3mf, amf, stl")
+				os.Exit(1)
+			}
+			outDir := ""
+			for i := 3; i < len(args); i++ {
+				if args[i] == "--out" && i+1 < len(args) {
+					outDir = args[i+1]
+					i++
+				} else if strings.HasPrefix(args[i], "--out=") {
+					outDir = strings.TrimPrefix(args[i], "--out=")
+				}
+			}
+			scadPath := args[1]
+			if !strings.HasSuffix(scadPath, ".scad") {
+				scadPath = resolveScad(scadPath)
+				if scadPath == "" {
+					fmt.Fprintf(os.Stderr, "❌ File not found: %s\n", args[1])
+					os.Exit(1)
+				}
+			}
+			cmdExport(scadPath, args[2], outDir)
 			return
 
 		case "from":
