@@ -29,6 +29,48 @@ you> save makita-drill-mount
 ./modelgen --prompt "CNC flatpack box 200x150x100mm for my workbench" --name workbench-box
 ```
 
+## Subcommands
+
+### List available templates and samples
+```bash
+modelgen samples
+```
+
+### Show parameters for a template
+```bash
+modelgen params box_parametric
+modelgen params cnc_routed_box
+```
+
+### Instantiate a template with overrides
+```bash
+modelgen from box_parametric width=120 depth=90 height=50 fillet=5
+modelgen from cnc_routed_box box_w=300 box_d=200 box_h=150 material_t=18
+```
+
+### Render to STL
+```bash
+modelgen render openscad/samples/phone_stand.scad
+modelgen render-all openscad/samples
+```
+
+### Preview as PNG (headless — no display required)
+```bash
+# Quick visual inspection before printing
+modelgen preview openscad/samples/phone_stand.scad
+modelgen preview cnc_routed_box --out ./previews --size 1200x800
+```
+
+### Export for CNC or slicer
+```bash
+# SVG/DXF for CNC toolpath software (Fusion 360, VCarve, Carbide Create)
+modelgen export openscad/cnc-box/cnc_routed_box.scad svg
+modelgen export openscad/cnc-box/cnc_routed_box.scad dxf --out ./cnc-output
+
+# 3MF for richer slicer import (preserves colour)
+modelgen export openscad/samples/phone_stand.scad 3mf
+```
+
 ## Visualize Parameters
 
 ```bash
@@ -50,6 +92,11 @@ python3 cli/vizparams.py openscad/samples/ --json
 | `box_parametric.scad` | General purpose box — 3D print or CNC mode, lid lip |
 | `french_cleat_mount.scad` | French cleat wall mount with 45° hook geometry |
 | `flatpack_box.scad` | CNC finger-joint flatpack box with dogbone reliefs |
+
+### `/openscad/cnc-box/`
+| File | What it is |
+|------|-----------|
+| `cnc_routed_box.scad` | Full 6-panel flat-pack box — finger joints, dogbones, lid option |
 
 ### `/openscad/samples/` — 10 ready-to-use models
 | File | Description |
@@ -95,7 +142,7 @@ The CLI pre-loads these so you never have to repeat them:
 |------|------|----------|
 | Box / tray / enclosure | OpenSCAD CLI | `box_parametric.scad` |
 | French cleat storage | OpenSCAD CLI | `french_cleat_mount.scad` |
-| CNC flatpack | OpenSCAD CLI | `flatpack_box.scad` |
+| CNC flatpack | OpenSCAD CLI | `flatpack_box.scad` or `cnc_routed_box.scad` |
 | Electronics case | OpenSCAD CLI | `electronics_enclosure.scad` |
 | Custom tool holder | OpenSCAD CLI (generate) | — |
 | Character / organic shape | Blender (manual + instructions) | see `blender-organic-workflow.md` |
@@ -104,7 +151,8 @@ The CLI pre-loads these so you never have to repeat them:
 
 - **Go** 1.21+ (for CLI build)
 - **Ollama** running locally (`http://localhost:11434`) with a model (default: `qwen3:14b`)
-- **OpenSCAD** (optional) — for auto-rendering `.stl` on `save`
+- **OpenSCAD** (optional) — for auto-rendering `.stl` on `save`, and for `render`, `preview`, `export` subcommands
+- **xvfb-run** (optional) — for `modelgen preview` in headless environments (server/cron)
 - **Python 3.10+** — for `vizparams.py`
 
 ## Build CLI
