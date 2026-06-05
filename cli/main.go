@@ -17,6 +17,58 @@ import (
 	"time"
 )
 
+// ------------------------------------------------------------
+// Session history — persisted to ~/.modelgen_history.jsonl
+// Each line is a HistoryEntry JSON object.
+// ------------------------------------------------------------
+
+type HistoryEntry struct {
+	Timestamp  string `json:"ts"`
+	SessionID  string `json:"session_id"`
+	Prompt     string `json:"prompt"`
+	ModelName  string `json:"model_name,omitempty"`
+	FileSaved  string `json:"file_saved,omitempty"`
+	NumLines   int    `json:"scad_lines,omitempty"`
+}
+
+func historyPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".modelgen_history.jsonl")
+}
+
+func appendHistory(entry HistoryEntry) {
+	f, err := os.OpenFile(historyPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	data, _ := json.Marshal(entry)
+	f.Write(data)
+	f.WriteString("\n")
+}
+
+func loadHistory(limit int) []HistoryEntry {
+	data, err := os.ReadFile(historyPath())
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var entries []HistoryEntry
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var e HistoryEntry
+		if json.Unmarshal([]byte(line), &e) == nil {
+			entries = append(entries, e)
+		}
+	}
+	// Return last N entries
+	if limit > 0 && len(entries) > limit {
+		entries = entries[len(entries)-limit:]
+	}
+	return entries
+}
+
 const defaultModel = "qwen3:14b"
 const ollamaURL = "http://localhost:11434/api/chat"
 
@@ -164,6 +216,28 @@ func saveAndRender(scadCode, name, outDir string) error {
 		fmt.Printf("ℹ️  OpenSCAD not found — install to auto-render STL\n")
 	}
 	return nil
+}
+
+// autosave writes to ~/.modelgen_autosave/<name>_<ts>.scad
+// Returns the saved path, or empty string on failure.
+func autosave(scadCode, name string) string {
+	dir := filepath.Join(os.Getenv("HOME"), ".modelgen_autosave")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return ""
+	}
+	ts := time.Now().Format("20060102_150405")
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, name)
+	fname := safe + "_" + ts + ".scad"
+	path := filepath.Join(dir, fname)
+	if err := os.WriteFile(path, []byte(scadCode), 0644); err != nil {
+		return ""
+	}
+	return path
 }
 
 // ------------------------------------------------------------
@@ -731,6 +805,45 @@ func cmdInstall() {
 }
 
 // ------------------------------------------------------------
+// Command: history — show past generations
+// ------------------------------------------------------------
+func cmdHistory(n int) {
+	entries := loadHistory(n)
+	if len(entries) == 0 {
+		fmt.Println("No generation history found. Generate some models first!")
+		fmt.Printf("History is stored at: %s\n", historyPath())
+		return
+	}
+	fmt.Printf("\n📜 modelgen history (%d most recent)\n\n", len(entries))
+	fmt.Printf("  %-20s  %-12s  %-30s  %s\n", "When", "Session", "File saved", "Prompt")
+	fmt.Printf("  %-20s  %-12s  %-30s  %s\n",
+		strings.Repeat("─", 20), strings.Repeat("─", 12),
+		strings.Repeat("─", 30), strings.Repeat("─", 40))
+	for _, e := range entries {
+		ts := e.Timestamp
+		if t, err := time.Parse(time.RFC3339, ts); err == nil {
+			ts = t.Format("Jan 02 15:04")
+		}
+		sessionShort := e.SessionID
+		if len(sessionShort) > 12 {
+			sessionShort = sessionShort[:12]
+		}
+		saved := e.FileSaved
+		if saved == "" {
+			saved = "(not saved)"
+		} else if len(saved) > 30 {
+			saved = "…" + saved[len(saved)-29:]
+		}
+		prompt := e.Prompt
+		if len(prompt) > 60 {
+			prompt = prompt[:57] + "…"
+		}
+		fmt.Printf("  %-20s  %-12s  %-30s  %s\n", ts, sessionShort, saved, prompt)
+	}
+	fmt.Printf("\nHistory file: %s\n\n", historyPath())
+}
+
+// ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
 func humanSize(n int64) string {
@@ -756,6 +869,7 @@ SUBCOMMANDS
   modelgen preview <file.scad>     Render a .scad to PNG for visual inspection
   modelgen export <file.scad> <fmt> Export to dxf, svg, 3mf, amf (for CNC/slicers)
   modelgen from <name> [k=v ...]   Instantiate a template with param overrides
+  modelgen history [N]             Show last N generations (default: 20)
   modelgen install                 Copy binary to ~/.local/bin/modelgen
   modelgen help                    Show this help
 
@@ -766,6 +880,12 @@ FLAGS (for interactive + one-shot modes)
 
 PREVIEW OPTIONS
   --size <WxH>      Image size for preview PNG (default: 800x600)
+
+HISTORY & AUTO-SAVE
+  Every generation in interactive and one-shot mode is auto-saved to:
+    ~/.modelgen_autosave/<session>_<ts>.scad
+  Use 'modelgen history' to review past prompts and saved files.
+  History log: ~/.modelgen_history.jsonl
 
 EXAMPLES
   # List everything available
@@ -796,6 +916,10 @@ EXAMPLES
 
   # One-shot: generate from description
   modelgen -prompt "Makita drill French cleat mount" -name drill_mount
+
+  # Review generation history
+  modelgen history
+  modelgen history 10
 
   # Interactive chat mode
   modelgen
@@ -997,6 +1121,16 @@ func main() {
 			cmdInstall()
 			return
 
+		case "history":
+			n := 20
+			if len(args) >= 2 {
+				if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+					n = v
+				}
+			}
+			cmdHistory(n)
+			return
+
 		case "help", "--help", "-h":
 			printHelp()
 			return
@@ -1033,6 +1167,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Session ID: short timestamp for grouping history entries
+	sessionID := time.Now().Format("20060102_150405")
+
 	// One-shot mode
 	if oneShot != "" {
 		fmt.Printf("🤖 Generating model...\n")
@@ -1049,12 +1186,21 @@ func main() {
 		}
 		modelName := name
 		if modelName == "" {
-			modelName = "model_" + time.Now().Format("20060102_150405")
+			modelName = "model_" + sessionID
 		}
+		savedPath := filepath.Join(outDir, modelName+".scad")
 		if err := saveAndRender(scad, modelName, outDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Save error: %v\n", err)
 			os.Exit(1)
 		}
+		appendHistory(HistoryEntry{
+			Timestamp: time.Now().Format(time.RFC3339),
+			SessionID: sessionID,
+			Prompt:    oneShot,
+			ModelName: modelName,
+			FileSaved: savedPath,
+			NumLines:  strings.Count(scad, "\n"),
+		})
 		return
 	}
 
@@ -1063,6 +1209,7 @@ func main() {
 	fmt.Println("╔════════════════════════════════════════╗")
 	fmt.Println("║   3D Model Generator — Friday CLI      ║")
 	fmt.Println("╚════════════════════════════════════════╝")
+	fmt.Printf("Session: %s\n", sessionID)
 	fmt.Println("Describe a model, say 'save <name>' to save, 'exit' to quit.")
 	fmt.Println("French cleat dims, CNC params, and print profiles are pre-loaded.")
 	fmt.Println("Tip: run 'modelgen samples' to see available templates.")
@@ -1070,6 +1217,7 @@ func main() {
 
 	currentSCAD := ""
 	currentName := name
+	lastPrompt := ""
 
 	for {
 		fmt.Print("you> ")
@@ -1090,7 +1238,7 @@ func main() {
 				saveName = parts[1]
 			}
 			if saveName == "" {
-				saveName = "model_" + time.Now().Format("20060102_150405")
+				saveName = "model_" + sessionID
 			}
 			if currentSCAD == "" {
 				fmt.Println("Nothing to save yet — generate a model first.")
@@ -1098,6 +1246,16 @@ func main() {
 			}
 			if err := saveAndRender(currentSCAD, saveName, outDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Save error: %v\n", err)
+			} else {
+				savedPath := filepath.Join(outDir, saveName+".scad")
+				appendHistory(HistoryEntry{
+					Timestamp: time.Now().Format(time.RFC3339),
+					SessionID: sessionID,
+					Prompt:    lastPrompt,
+					ModelName: saveName,
+					FileSaved: savedPath,
+					NumLines:  strings.Count(currentSCAD, "\n"),
+				})
 			}
 			currentName = saveName
 			continue
@@ -1113,6 +1271,11 @@ func main() {
 		scad := extractSCAD(resp)
 		if scad != "" {
 			currentSCAD = scad
+			lastPrompt = input
+
+			// Auto-save to ~/.modelgen_autosave/
+			autosaved := autosave(scad, sessionID)
+
 			fmt.Printf("\n📐 Generated SCAD (%d lines):\n", strings.Count(scad, "\n"))
 			// Show first 15 lines as preview
 			lines := strings.Split(scad, "\n")
@@ -1120,11 +1283,14 @@ func main() {
 			if len(lines) > 15 {
 				preview = lines[:15]
 				fmt.Println(strings.Join(preview, "\n"))
-				fmt.Printf("... (%d more lines) — say 'save <name>' to save\n", len(lines)-15)
+				fmt.Printf("... (%d more lines)\n", len(lines)-15)
 			} else {
 				fmt.Println(strings.Join(preview, "\n"))
-				fmt.Println("Say 'save <name>' to write the file.")
 			}
+			if autosaved != "" {
+				fmt.Printf("📂 Auto-saved: %s\n", autosaved)
+			}
+			fmt.Println("Say 'save <name>' to write to ./models/ and render STL.")
 		} else {
 			// No SCAD block — show the response as-is (explanation or question)
 			fmt.Println()
