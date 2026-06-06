@@ -70,7 +70,19 @@ func loadHistory(limit int) []HistoryEntry {
 }
 
 const defaultModel = "qwen3:14b"
-const ollamaURL = "http://localhost:11434/api/chat"
+const defaultOllamaHost = "http://localhost:11434"
+
+// Runtime-configurable (set once at startup from env / flags)
+var activeModel string
+var activeOllamaHost string
+
+func ollamaURL() string {
+	return activeOllamaHost + "/api/chat"
+}
+
+func ollamaTagsURL() string {
+	return activeOllamaHost + "/api/tags"
+}
 
 // Location of the templates/samples relative to the repo root.
 // Resolved from the binary's own path.
@@ -144,13 +156,13 @@ func chat(userMsg string) (string, error) {
 	conversation = append(conversation, Message{Role: "user", Content: userMsg})
 
 	reqBody, _ := json.Marshal(ChatRequest{
-		Model:    defaultModel,
+		Model:    activeModel,
 		Messages: conversation,
 		Stream:   false,
 	})
 
 	client := &http.Client{Timeout: 180 * time.Second}
-	resp, err := client.Post(ollamaURL, "application/json", bytes.NewReader(reqBody))
+	resp, err := client.Post(ollamaURL(), "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("ollama request failed: %w", err)
 	}
@@ -844,6 +856,151 @@ func cmdHistory(n int) {
 }
 
 // ------------------------------------------------------------
+// Command: config — show active model/endpoint configuration
+// ------------------------------------------------------------
+func cmdConfig() {
+	fmt.Println("\n⚙️  modelgen configuration\n")
+	fmt.Printf("  Model:       %s\n", activeModel)
+	fmt.Printf("  Ollama host: %s\n", activeOllamaHost)
+	fmt.Printf("  API URL:     %s\n", ollamaURL())
+	fmt.Println()
+	fmt.Println("  Override with environment variables:")
+	fmt.Println("    MODELGEN_MODEL=qwen3:32b      -- use a different model")
+	fmt.Println("    MODELGEN_OLLAMA=http://10.0.0.251:11434  -- use remote Ollama (Mini)")
+	fmt.Println()
+	fmt.Println("  Override with flags (interactive + one-shot):")
+	fmt.Println("    --model qwen3:32b")
+	fmt.Println("    --ollama http://10.0.0.251:11434")
+
+	// Try to list available models from the active Ollama endpoint
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(ollamaTagsURL())
+	if err != nil {
+		fmt.Printf("\n  ⚠️  Cannot reach Ollama at %s: %v\n", activeOllamaHost, err)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var tagsResp struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &tagsResp); err != nil || len(tagsResp.Models) == 0 {
+		fmt.Printf("\n  ℹ️  No models found at %s (or parse error)\n", activeOllamaHost)
+		return
+	}
+	fmt.Printf("\n  Models available at %s:\n", activeOllamaHost)
+	for _, m := range tagsResp.Models {
+		marker := "  "
+		if m.Name == activeModel {
+			marker = "▶ "
+		}
+		fmt.Printf("    %s%s\n", marker, m.Name)
+	}
+	fmt.Println()
+}
+
+// ------------------------------------------------------------
+// Command: validate — check a .scad file for geometry errors
+// ------------------------------------------------------------
+func cmdValidate(scadPath string) {
+	if !strings.HasSuffix(scadPath, ".scad") {
+		resolved := resolveScad(scadPath)
+		if resolved == "" {
+			fmt.Fprintf(os.Stderr, "❌ File not found: %s\n", scadPath)
+			os.Exit(1)
+		}
+		scadPath = resolved
+	}
+	if _, err := os.Stat(scadPath); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Cannot read file: %s\n", scadPath)
+		os.Exit(1)
+	}
+
+	if _, err := exec.LookPath("openscad"); err != nil {
+		fmt.Println("⚠️  OpenSCAD not installed — cannot validate geometry")
+		fmt.Println("   Install: sudo apt install openscad  (or brew install openscad)")
+		os.Exit(1)
+	}
+
+	fmt.Printf("🔍 Validating: %s\n", scadPath)
+
+	// Render to temp STL to catch geometry errors
+	var stderrBuf bytes.Buffer
+	tmpOut := filepath.Join(os.TempDir(), "modelgen_validate_out.stl")
+	defer os.Remove(tmpOut)
+
+	cmd := exec.Command("openscad", "-o", tmpOut, scadPath)
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	stderrOut := strings.TrimSpace(stderrBuf.String())
+
+	// Parse warnings and errors from stderr
+	lines := strings.Split(stderrOut, "\n")
+	errors := []string{}
+	warnings := []string{}
+	infoLines := []string{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "error") || strings.Contains(lower, "error:") {
+			errors = append(errors, line)
+		} else if strings.HasPrefix(lower, "warning") || strings.Contains(lower, "warning:") {
+			warnings = append(warnings, line)
+		} else {
+			infoLines = append(infoLines, line)
+		}
+	}
+
+	if err != nil && len(errors) == 0 {
+		// Generic failure — OpenSCAD exits non-zero for real errors
+		fmt.Printf("❌ OpenSCAD failed (exit code %v)\n", err)
+		if stderrOut != "" {
+			fmt.Println("Output:")
+			fmt.Println(stderrOut)
+		}
+		os.Exit(1)
+	}
+
+	if len(errors) > 0 {
+		fmt.Printf("❌ %d error(s) found:\n", len(errors))
+		for _, e := range errors {
+			fmt.Printf("   • %s\n", e)
+		}
+	}
+	if len(warnings) > 0 {
+		fmt.Printf("⚠️  %d warning(s):\n", len(warnings))
+		for _, w := range warnings {
+			fmt.Printf("   • %s\n", w)
+		}
+	}
+	if len(errors) == 0 {
+		// Check if output file was actually written and non-zero
+		info, statErr := os.Stat(tmpOut)
+		if statErr == nil && info.Size() > 0 {
+			fmt.Printf("✅ Valid geometry — STL renders cleanly (%s)\n", humanSize(info.Size()))
+			// Print geometry summary from OpenSCAD's info lines
+			for _, line := range infoLines {
+				if strings.Contains(line, "Simple:") || strings.Contains(line, "Vertices:") ||
+					strings.Contains(line, "Facets:") || strings.Contains(line, "rendering time") {
+					fmt.Printf("   %s\n", line)
+				}
+			}
+		} else {
+			fmt.Println("✅ No errors found (output file empty — model may be degenerate)")
+		}
+	}
+	if len(warnings) == 0 && len(errors) == 0 {
+		fmt.Println("   No warnings.")
+	}
+}
+
+// ------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------
 func humanSize(n int64) string {
@@ -869,6 +1026,8 @@ SUBCOMMANDS
   modelgen preview <file.scad>     Render a .scad to PNG for visual inspection
   modelgen export <file.scad> <fmt> Export to dxf, svg, 3mf, amf (for CNC/slicers)
   modelgen from <name> [k=v ...]   Instantiate a template with param overrides
+  modelgen validate <file.scad>    Check a .scad file for geometry errors
+  modelgen config                  Show active model/endpoint config + available models
   modelgen history [N]             Show last N generations (default: 20)
   modelgen install                 Copy binary to ~/.local/bin/modelgen
   modelgen help                    Show this help
@@ -877,6 +1036,15 @@ FLAGS (for interactive + one-shot modes)
   -prompt <text>    One-shot: generate a model from description and exit
   -name <name>      Output filename (without extension)
   -out <dir>        Output directory (default: ./models)
+
+GLOBAL FLAGS (any mode, before subcommand)
+  --model <name>    Override Ollama model (default: qwen3:14b)
+  --ollama <url>    Override Ollama host (default: http://localhost:11434)
+
+ENVIRONMENT VARIABLES
+  MODELGEN_MODEL    Ollama model to use (e.g. qwen3:32b, deepseek-r1:32b)
+  MODELGEN_OLLAMA   Ollama host URL (e.g. http://10.0.0.251:11434 for Mini)
+  MODELGEN_ROOT     Explicit repo root path
 
 PREVIEW OPTIONS
   --size <WxH>      Image size for preview PNG (default: 800x600)
@@ -913,6 +1081,16 @@ EXAMPLES
 
   # Render all samples to stl-output/
   modelgen render-all openscad/samples
+
+  # Validate a .scad file for geometry errors
+  modelgen validate openscad/samples/phone_stand.scad
+
+  # Check current config + available models
+  modelgen config
+
+  # Use a different model (e.g. after upgrading Mini to qwen3:32b)
+  MODELGEN_MODEL=qwen3:32b MODELGEN_OLLAMA=http://10.0.0.251:11434 modelgen
+  modelgen --model qwen3:32b --ollama http://10.0.0.251:11434 -prompt "CNC box"
 
   # One-shot: generate from description
   modelgen -prompt "Makita drill French cleat mount" -name drill_mount
@@ -978,7 +1156,37 @@ func initRepoRoot() {
 func main() {
 	initRepoRoot()
 
+	// Initialize active config from env vars (can be overridden by flags later)
+	activeModel = os.Getenv("MODELGEN_MODEL")
+	if activeModel == "" {
+		activeModel = defaultModel
+	}
+	activeOllamaHost = os.Getenv("MODELGEN_OLLAMA")
+	if activeOllamaHost == "" {
+		activeOllamaHost = defaultOllamaHost
+	}
+
 	args := os.Args[1:]
+
+	// Strip global --model / --ollama flags from args before subcommand dispatch
+	var cleanArgs []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "--model" || args[i] == "-model") && i+1 < len(args):
+			activeModel = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--model="):
+			activeModel = strings.TrimPrefix(args[i], "--model=")
+		case (args[i] == "--ollama" || args[i] == "-ollama") && i+1 < len(args):
+			activeOllamaHost = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--ollama="):
+			activeOllamaHost = strings.TrimPrefix(args[i], "--ollama=")
+		default:
+			cleanArgs = append(cleanArgs, args[i])
+		}
+	}
+	args = cleanArgs
 
 	// Handle subcommands first
 	if len(args) > 0 {
@@ -1131,6 +1339,18 @@ func main() {
 			cmdHistory(n)
 			return
 
+		case "config":
+			cmdConfig()
+			return
+
+		case "validate":
+			if len(args) < 2 {
+				fmt.Fprintln(os.Stderr, "Usage: modelgen validate <file.scad>")
+				os.Exit(1)
+			}
+			cmdValidate(args[1])
+			return
+
 		case "help", "--help", "-h":
 			printHelp()
 			return
@@ -1210,6 +1430,7 @@ func main() {
 	fmt.Println("║   3D Model Generator — Friday CLI      ║")
 	fmt.Println("╚════════════════════════════════════════╝")
 	fmt.Printf("Session: %s\n", sessionID)
+	fmt.Printf("Model:   %s  (host: %s)\n", activeModel, activeOllamaHost)
 	fmt.Println("Describe a model, say 'save <name>' to save, 'exit' to quit.")
 	fmt.Println("French cleat dims, CNC params, and print profiles are pre-loaded.")
 	fmt.Println("Tip: run 'modelgen samples' to see available templates.")

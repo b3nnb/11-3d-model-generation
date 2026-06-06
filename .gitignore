@@ -1,0 +1,21 @@
+# Generated models (user's work — not tracked)
+cli/models/
+models/
+
+# Rendered previews (generated artifacts)
+previews/*.png
+
+# Auto-save directory
+cli/autosave/
+
+# STL renders in samples (can be regenerated)
+openscad/samples/*.stl
+openscad/templates/*.stl
+openscad/cnc-box/*.stl
+openscad/french-cleat/*.stl
+
+# macOS / Linux junk
+.DS_Store
+*.swp
+
+# Build artifacts (binary is in cli/.gitignore already)
